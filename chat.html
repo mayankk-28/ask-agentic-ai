@@ -555,6 +555,24 @@ body[data-theme="dark"] .clear-history {
       let toastTimer = null;
 
       function makeId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
+      // ---- Memory lives in the browser; the server stays stateless ----
+      const MEMORY_KEY = "ask_memory_v1";
+      function loadMemory() {
+        try {
+          const m = JSON.parse(localStorage.getItem(MEMORY_KEY) || "{}");
+          return m && typeof m === "object" && !Array.isArray(m) ? m : {};
+        } catch { return {}; }
+      }
+      function saveMemory(updates) {
+        if (!updates || !Object.keys(updates).length) return;
+        try { localStorage.setItem(MEMORY_KEY, JSON.stringify({ ...loadMemory(), ...updates })); } catch {}
+      }
+      function buildHistory() {
+        return currentMessages
+          .filter(m => m.text && !(m.meta || "").startsWith("Connection"))
+          .map(m => ({ role: m.role === "user" ? "user" : "assistant", content: m.text }))
+          .slice(-20);
+      }
       function loadChats() {
         try {
           const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
@@ -665,12 +683,16 @@ body[data-theme="dark"] .clear-history {
         renderMessage("user", question, "You");
         const pending = addTypingIndicator();
         try {
-          const response = await fetch(`/ask?question=${encodeURIComponent(question)}`, { method: "GET", headers: { Accept: "application/json" } });
+          const response = await fetch("/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Accept: "application/json" },
+            body: JSON.stringify({ messages: buildHistory(), memory: loadMemory() })
+          });
           const data = await response.json();
           if (!response.ok) throw new Error(typeof data.detail === "string" ? data.detail : `Request failed (${response.status})`);
           pending.remove();
-          const answer = formatResult(data.result);
-          renderMessage("assistant", answer || "I didn't receive a response. Please try again.", "ASK · Response");
+          saveMemory(data.memory_updates);
+          renderMessage("assistant", data.reply || "I didn't receive a response. Please try again.", "ASK · Response");
         } catch (error) {
           pending.remove();
           renderMessage("assistant", "I couldn't complete that request. Check that the ASK FastAPI server is running, then try again.", `Connection · ${error.message}`);
