@@ -1,683 +1,318 @@
 # ASK — Agentic AI Assistant 🤖
 
-> **Ask something. Let the agent figure out the tool.**
+> **Ask anything. The agent decides when it needs a tool.**
 
-ASK is a learning-focused Agentic AI application built with Python and FastAPI. It combines a browser-based chat interface with an API backend, Gemini-powered intent detection and general answers, tool routing, calculator logic, weather data, external user data, and a small JSON-based memory system.
+ASK is a conversational AI assistant built with Python and FastAPI. A language model reads your message, decides on its own whether a tool is needed (calculator, weather, date/time, memory), runs it, and writes the final answer in natural language. It remembers the conversation, replies in the language you write in (English, Hindi or Hinglish), and automatically switches to a backup model if the main one is unavailable.
 
-- **Live application:** https://agentic-ai-learning.onrender.com
-- **API documentation:** https://agentic-ai-learning.onrender.com/docs
+The entire stack runs on **free tiers**: no paid API or hosting is needed.
+
+- **Live app:** https://agentic-ai-learning.onrender.com
+- **API docs (Swagger):** https://agentic-ai-learning.onrender.com/docs
 - **Source code:** https://github.com/mayankk-28/agentic-ai-learning
 
-> **Project status:** Active learning project. Features and implementation may change as the project develops.
+> The app is hosted on Render's free plan. It goes to sleep after ~15 minutes without traffic, so the **first request can take up to a minute** while it wakes up.
 
 ---
 
 ## Table of contents
 
-1. [Project goals](#-project-goals)
-2. [Architecture and request lifecycle](#-architecture-and-request-lifecycle)
-3. [Technology stack](#-technology-stack)
-4. [Backend walkthrough](#-backend-walkthrough)
-5. [Agent orchestration and routing](#-agent-orchestration-and-routing)
-6. [Gemini integration](#-gemini-integration)
-7. [Calculator tool](#-calculator-tool)
-8. [Weather tool](#-weather-tool)
-9. [User data tools](#-user-data-tools)
-10. [Memory system](#-memory-system)
-11. [Fun Zone](#-fun-zone)
-12. [Browser chat interface](#-browser-chat-interface)
-13. [API reference](#-api-reference)
-14. [Run locally](#-run-locally)
-15. [Environment variables and secrets](#-environment-variables-and-secrets)
-16. [Error handling and current limitations](#-error-handling-and-current-limitations)
-17. [Learning outcomes](#-learning-outcomes)
-18. [Future improvements](#-future-improvements)
+1. [Features](#-features)
+2. [How it works](#-how-it-works)
+3. [Tech stack](#-tech-stack)
+4. [Project structure](#-project-structure)
+5. [Tools the agent can use](#-tools-the-agent-can-use)
+6. [Reliability: provider fallback](#-reliability-provider-fallback)
+7. [Memory and chat history](#-memory-and-chat-history)
+8. [API reference](#-api-reference)
+9. [Run locally](#-run-locally)
+10. [Environment variables](#-environment-variables)
+11. [Deploy on Render](#-deploy-on-render)
+12. [Limitations](#-limitations)
+13. [Roadmap](#-roadmap)
+14. [What I learned](#-what-i-learned)
+15. [About](#-about)
 
 ---
 
-## 🎯 Project goals
+## ✨ Features
 
-ASK was created to learn how an AI-agent-style application can:
+- **Real LLM tool-calling.** The model chooses tools itself; there is no keyword router or fixed intent list.
+- **Open-ended chat.** Most questions need no tool, and the model simply answers them.
+- **Follow-up questions work.** The recent conversation is sent with every request, so "explain more" or "give an example" has context.
+- **Five built-in tools:** calculator, weather for any city, current date and time, a demo user lookup, and memory.
+- **Safe calculator.** Expressions are parsed with Python's `ast` module. `eval()` is never used.
+- **Automatic fallback.** If Gemini is overloaded or rate-limited, the request moves to Groq.
+- **Multilingual.** The assistant answers in the language the user writes in.
+- **Browser chat UI.** Saved chat history, history search, light/dark theme, and a Fun Zone with jokes and a trivia quiz.
+- **Basic abuse protection.** Per-IP rate limiting protects the free API quota.
 
-- Accept a user's question through a web interface or API.
-- Detect the likely task or intent.
-- Choose an appropriate tool for supported requests.
-- Call external APIs when required.
-- Perform calculations locally or execute a model-generated calculation plan.
-- Remember selected values using a local JSON file.
-- Continue to support some simple calculations when Gemini is unavailable.
-- Return structured results to the browser.
+---
 
-The project is built incrementally to understand the components behind an agent rather than treating an LLM as a standalone chatbot.
-
-## 🏗️ Architecture and request lifecycle
-
-The main chat request follows this high-level flow:
+## 🏗️ How it works
 
 ```text
-User
- |
- v
-Browser chat interface (chat.html)
- |
- | GET /ask?question=...
- v
-FastAPI endpoint: ask_ai()
- |
- v
-simple_agent(question)
- |
- +--> Greeting check
- |
- +--> Fun Zone check
- |
- +--> Save/read selected memory
- |
- +--> Fast keyword routing for simple calculations
- |
- +--> Gemini intent detection for other requests
- |       |
- |       +--> Local keyword fallback if needed
- |
- +--> Execute matching tools
- |       +--> Calculator
- |       +--> Weather
- |       +--> User data
- |
- +--> General Gemini answer if no tool result exists
- |
- v
-JSON response from FastAPI
- |
- v
-Browser formats and displays the result
+Browser (chat.html)
+   |
+   |  POST /chat   { messages: [...recent chat...], memory: {...} }
+   v
+FastAPI (main.py)
+   |  validate input, rate-limit by IP
+   v
+Agent loop (agent.py)
+   |
+   |  1. Build system prompt (+ remembered facts)
+   |  2. Ask the LLM  (Gemini first, Groq as fallback)
+   |  3. Did the model request a tool?
+   |        yes -> run it (tools.py), send the result back, go to step 2
+   |        no  -> this is the final answer
+   |  (max 5 tool rounds per message)
+   v
+{ reply, memory_updates, provider }
+   |
+   v
+Browser shows the reply and stores any new memory
 ```
 
-This diagram describes the implementation's main path. Exact behavior depends on the request and whether the relevant external service is available.
+### Example: "What is 15% of 2400, and what's the weather in Bhopal?"
 
-### Example: calculator request
+1. The model requests `calculator("15/100*2400")` and `get_weather("Bhopal")`.
+2. The server runs both tools and returns the results to the model.
+3. The model writes one natural answer using both results.
 
-For a request such as `20 times 5`:
-
-1. The browser sends the question to `/ask`.
-2. `ask_ai()` passes the question to `simple_agent()`.
-3. `simple_agent()` tries the local keyword router.
-4. If the request is classified as a simple calculator request, `calculator_tool()` is called directly.
-5. The backend returns the result in JSON.
-6. The browser displays the result.
-
-### Example: general question
-
-For a question that does not match a supported tool:
-
-1. The request reaches `simple_agent()`.
-2. Greeting, Fun Zone, memory, and fast calculator checks run first.
-3. Gemini is asked to classify the intent.
-4. If no tool result is produced, `general_answer()` attempts to generate a response.
-5. The response is returned to the browser.
+For a question like "What is Python?", no tool is called and the model answers directly.
 
 ---
 
-## 🧰 Technology stack
+## 🧰 Tech stack
 
-| Technology | Role in this project |
+| Technology | Role |
 |---|---|
-| Python | Backend logic and tool functions |
-| FastAPI | HTTP API and route definitions |
-| Pydantic | Validation of the `User` request model |
-| Gemini API | Intent detection, calculator planning, and general answers |
-| OpenAI Python SDK | Client interface used with Gemini's OpenAI-compatible endpoint |
-| Uvicorn | Local ASGI server |
-| Requests | HTTP requests to external services |
-| python-dotenv | Loads values from `.env` |
-| JSON | Backend memory storage and API data |
-| HTML, CSS, JavaScript | Browser chat interface |
-| `localStorage` | Browser-side saved chat history and theme preference |
-| Git and GitHub | Version control and source hosting |
-| Render | Hosted application |
+| Python 3 | Backend and tools |
+| FastAPI | HTTP API |
+| Pydantic | Request validation |
+| Uvicorn | ASGI server |
+| OpenAI Python SDK | Client for Gemini and Groq (both expose OpenAI-compatible APIs) |
+| Google Gemini API | Primary LLM |
+| Groq API | Fallback LLM |
+| Open-Meteo | Weather and geocoding (free, no API key) |
+| JSONPlaceholder | Demo user data |
+| HTML, CSS, JavaScript | Chat interface (no framework) |
+| `localStorage` | Chat history and memory, stored in the browser |
+| Render | Free hosting |
 
 ---
 
-## 🔍 Backend walkthrough
-
-The backend lives primarily in `main.py`.
-
-### 1. Imports and application setup
-
-The file imports the libraries used for HTTP routes, HTML responses, request validation, environment variables, external HTTP requests, JSON, random choices, and the Gemini client.
-
-The FastAPI application is created with:
-
-```python
-app = FastAPI()
-```
-
-The project loads environment variables using `load_dotenv()` and creates an OpenAI-compatible client pointed at Gemini's endpoint:
-
-```python
-client = OpenAI(
-    api_key=os.getenv("GEMINI_API_KEY"),
-    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
-)
-```
-
-The model used in the current code is `gemini-3.8-flash`.
-
-The application also reads `APP_NAME` and `ENVIRONMENT`, with defaults if those variables are not set.
-
-### 2. Serving the chat page
-
-The `/` and `/chat` routes return `chat.html` using `FileResponse`. This lets a browser open the chat UI rather than seeing only a JSON response.
-
-### 3. Request validation with Pydantic
-
-The `User` model declares two fields:
-
-```python
-class User(BaseModel):
-    name: str
-    age: int
-```
-
-FastAPI uses this model to parse and validate the JSON body for `POST /user`.
-
-### 4. External HTTP requests
-
-The backend uses `requests.get()` to call external services. Some calls check HTTP status codes or catch `requests.RequestException` so an external service failure can be represented as an error result.
-
----
-
-## 🧭 Agent orchestration and routing
-
-The main coordinator is:
-
-```python
-simple_agent(question: str)
-```
-
-It processes a request through a sequence of checks. The order matters because a request may be handled before Gemini is called.
-
-### Processing order
-
-1. **Greeting check:** common greetings receive a direct response without calling Gemini.
-2. **Fun Zone:** checks whether the request asks for a joke, interesting fact, or riddle interaction.
-3. **Memory commands:** recognizes supported phrases to save or retrieve the user's name and city.
-4. **Fast calculator routing:** calls `route_tool()` for a quick keyword-based classification. Simple calculator-only questions can be handled locally.
-5. **Gemini intent detection:** other requests are passed to `llm_detect_intents()`.
-6. **Tool execution:** the returned intents determine whether the user, calculator, and/or weather tools are called.
-7. **General answer:** if no tool result is produced, `general_answer()` is used.
-
-The function may return a dictionary containing one or more tool results. The `/ask` endpoint wraps that value with the original question.
-
-### `route_tool(question)`
-
-This is a lightweight, rule-based router. It looks for terms such as:
-
-- Calculator: `add`, `plus`, `subtract`, `minus`, `multiply`, `times`, `divide`
-- Weather: `weather`, `temperature`
-- User information: `user`
-- Arithmetic symbols: `+`, `-`, `*`, `/`
-- Percentages: `percent`, `%`
-
-It returns a list of matched tools, or the string `"none"` if it finds no match. Because it uses keywords, it is a basic heuristic rather than a full natural-language understanding system.
-
-### `llm_detect_intents(question)`
-
-This function asks Gemini to classify a question into the supported intents:
-
-- `weather`
-- `calculator`
-- `user`
-- `none`
-
-The model is instructed to return a JSON array, for example `["calculator", "weather"]`. The code parses the response with `json.loads()` and filters out values outside the allowed set.
-
-If the response is malformed or the Gemini request fails, the function uses `route_tool()` as a fallback. This gives the application a local routing path for some requests, although keyword routing cannot understand every phrasing.
-
----
-
-## 🧠 Gemini integration
-
-The project uses the OpenAI Python SDK's chat-completions interface with Gemini's OpenAI-compatible API endpoint.
-
-Gemini is used for three distinct tasks in the current code:
-
-1. **Intent detection** in `llm_detect_intents()`.
-2. **Calculation planning** in `calculator_plan()`.
-3. **General question answering** in `general_answer()`.
-
-The `/llm-test` endpoint separately calls `llm_test()` and returns the detected category.
-
-### Intent detection versus general answers
-
-These are different operations:
-
-- Intent detection is expected to return structured classification data.
-- General answering is expected to return helpful natural-language text.
-- Calculator planning is expected to return a JSON list of arithmetic operations.
-
-Keeping these tasks separate makes the program easier to inspect and debug.
-
-### API availability
-
-Gemini requests can fail because of missing or invalid credentials, quota limits, network issues, timeouts, or unexpected model output. Some paths include fallback logic; not every Gemini call uses identical timeout and retry behavior.
-
----
-
-## 🧮 Calculator tool
-
-The calculator implementation uses two approaches.
-
-### 1. Local arithmetic
-
-`calculator_tool(question)` extracts numbers from the question with a regular expression and checks for supported operation words.
-
-For supported simple requests, it performs the arithmetic in Python. The current local logic checks the operation words in the request and supports a limited multi-number path.
-
-Examples of intended inputs include:
+## 📁 Project structure
 
 ```text
-20 plus 5
-20 minus 5
-20 times 5
-100 divided by 5
+agentic-ai-learning/
+├── main.py            # FastAPI app: routes, validation, rate limiting
+├── agent.py           # Agent loop, system prompt, provider fallback
+├── tools.py           # Tool functions and their JSON schemas
+├── chat.html          # Browser chat UI (HTML + CSS + JS)
+├── requirements.txt   # Python dependencies
+└── .gitignore
 ```
 
-**Current limitation:** the local parser is keyword-based and limited. It should not be assumed to correctly interpret every expression, mixed operators, or every natural-language ordering.
-
-### 2. Model-generated calculation plan
-
-If the local calculation path cannot return a result, `calculator_tool()` calls:
-
-```python
-calculator_plan(question)
-```
-
-Gemini is asked to return a JSON list of sequential operations. Each operation contains an operation name and operands.
-
-Example of the expected plan shape:
-
-```json
-[
-  {"operation": "subtract", "a": 100, "b": 20},
-  {"operation": "multiply", "a": 80, "b": 5}
-]
-```
-
-This is an illustrative example of the schema expected by the code, not a guarantee that Gemini will always return that exact plan.
-
-### 3. Plan execution
-
-`execute_calculation_plan(plan)` iterates over the list and applies supported operations:
-
-- `add`
-- `subtract`
-- `multiply`
-- `divide`
-
-For subsequent steps, the previous result is used as the next operation's first operand. Division by zero returns a specific error message. Missing or invalid plan fields cause the function to return `None`.
-
-If planning or execution fails, the calculator returns a message that it could not understand the calculation.
+- **`main.py`** exposes the endpoints, validates requests and applies the rate limit.
+- **`agent.py`** contains the tool-calling loop and decides which model to call.
+- **`tools.py`** contains every tool and a dispatcher that never crashes the chat if a tool fails.
 
 ---
 
-## 🌦️ Weather tool
+## 🛠️ Tools the agent can use
 
-The function:
+| Tool | What it does |
+|---|---|
+| `calculator` | Evaluates arithmetic safely (`+ - * / ** % //`, parentheses). Rejects anything else, including attempts to run code. |
+| `get_weather` | Current temperature, humidity, wind and conditions for any city, via Open-Meteo geocoding and forecast. |
+| `get_current_datetime` | Today's date and time in a given timezone (default `Asia/Kolkata`). |
+| `get_sample_user` | Fetches a demo user profile (IDs 1–10) from JSONPlaceholder. |
+| `save_memory` | Stores a lasting fact the user shares (name, city, preferences). |
 
-```python
-weather_tool(question)
-```
-
-calls the Open-Meteo forecast endpoint:
-
-```text
-https://api.open-meteo.com/v1/forecast
-```
-
-The current implementation uses fixed coordinates:
-
-- Latitude: `23.18`
-- Longitude: `75.78`
-
-It requests these current weather fields:
-
-- `temperature_2m`
-- `wind_speed_10m`
-
-The function returns a dictionary containing the tool name, temperature, and wind speed. If the HTTP request raises a `requests.RequestException`, it returns an error dictionary.
-
-**Current limitation:** the question is accepted by the function, but the current code does not geocode a city from the question. The coordinates are fixed, so the returned weather data is for that configured location, not automatically the user's location.
-
-There is also a separate `/weather` route and a `get_weather(latitude, longitude)` helper in `main.py`; consult `/docs` and the source code for the exact behavior of that route.
+Each tool returns a small JSON result or an `{"error": ...}` object. The model reads that result and explains it in plain sentences.
 
 ---
 
-## 👤 User data tools
+## 🛡️ Reliability: provider fallback
 
-### `user_tool(question)`
+Free LLM tiers have rate limits and occasional overload, so ASK is built to survive that:
 
-This function requests user `1` from JSONPlaceholder:
-
-```text
-https://jsonplaceholder.typicode.com/users/1
-```
-
-It returns selected fields:
-
-- Name
-- Username
-- Email
-- City
-- Company
-
-It uses a timeout and catches `requests.RequestException`. If the request fails or the service returns a non-success status, the function returns an error result.
-
-**Current limitation:** the function's `question` argument is not used to choose a user ID; the request is currently hard-coded to user `1`.
-
-### `GET /external-user/{user_id}`
-
-This route accepts a user ID as a path parameter, calls JSONPlaceholder, and returns selected contact fields. If the HTTP status is not `200`, it raises an HTTP 404 error.
-
-### `POST /user`
-
-This route accepts a JSON body validated by the `User` Pydantic model and returns a greeting and the submitted age. It does not create an account or save the submitted user to a database.
-
-### `GET /search`
-
-This basic route accepts `name` and `age` query parameters and returns a greeting and age. Despite the name, the current implementation does not search a database.
+1. **Gemini** is tried first.
+2. On any failure (rate limit, `503`, timeout), the request automatically goes to **Groq**.
+3. Within one request, the agent **stays with the provider that started it**, because the two providers format tool calls slightly differently.
+4. Each call has a 20-second timeout, so a slow provider cannot freeze the chat.
+5. If every provider fails, the user gets a clear "service is busy" message with HTTP `503`.
 
 ---
 
-## 💾 Memory system
+## 💾 Memory and chat history
 
-The backend uses a local JSON file named `memory.json`.
+Render's free filesystem is wiped on every restart, so the server is deliberately **stateless**.
 
-### Loading memory
+- **Chat history** is saved in the browser (`localStorage`) and the recent messages are sent with each request.
+- **Memory** (for example your name) is also saved in the browser. The server receives it with each request, places it in the system prompt, and returns any updates for the browser to store.
 
-When `main.py` starts, it attempts to read and parse `memory.json`. If the file is missing or contains invalid JSON, the in-memory dictionary starts empty.
-
-### Saving memory
-
-The helper:
-
-```python
-save_memory(key, value)
-```
-
-updates the in-memory dictionary and writes it to `memory.json`.
-
-The current agent supports explicit phrases for saving and retrieving:
-
-- `my name is ...`
-- `what is my name`
-- `do you remember my name`
-- `my city is ...`
-- `what is my city`
-- `do you remember my city`
-
-The Fun Zone also stores the current riddle's answer and hint in this file so a later message can be checked against the active riddle.
-
-**Important distinction:** `memory.json` is backend-side application memory. It is not the same as the browser's chat history, which is stored in `localStorage`.
-
-**Current limitation:** this is a simple local file, not a multi-user database. Shared hosting, multiple workers, concurrent writes, and per-user privacy need a more robust storage design for production use.
-
----
-
-## 🎲 Fun Zone
-
-`fun_zone(question)` provides a small set of non-LLM interactions:
-
-- Random jokes
-- Interesting facts
-- Riddles
-- Riddle hints
-- Checking an answer against the stored riddle answer
-
-The function returns a result when it recognizes a supported Fun Zone request, and `simple_agent()` returns that result before normal intent detection. Riddle state is saved in `memory.json`.
-
-This is a rule-based feature; it does not require Gemini to generate the stored jokes, facts, or riddles.
-
----
-
-## 💬 Browser chat interface
-
-The browser UI is implemented in `chat.html` with HTML, CSS, and JavaScript.
-
-### Sending a question
-
-The JavaScript `sendQuestion()` function sends a GET request to:
-
-```text
-/ask?question=<URL-encoded-question>
-```
-
-It uses `encodeURIComponent()` to safely encode the question, parses the JSON response, formats the result, and displays the assistant's answer. A typing indicator is displayed while the request is in progress.
-
-### Chat history
-
-The interface stores conversations under the browser storage key:
-
-```text
-ask_chat_history_v1
-```
-
-The UI can save and render chat history, open an earlier conversation, start a new chat, and filter saved conversations. This history is stored in the browser's `localStorage`; it is not sent to `memory.json` by the chat-history code described here.
-
-### Additional interface features
-
-The current frontend code also includes:
-
-- Suggested question buttons
-- A Fun Zone view
-- A quiz with category and difficulty selection
-- Quiz loading from an external trivia API
-- Joke display
-- A surprise-me action
-- Light/dark theme preference stored under `ask-theme`
-- Responsive navigation and history panel behavior
-
-The quiz uses a separate external trivia API and is distinct from the backend's `/ask` agent flow.
+This works with no database and no cost. The trade-off is that memory is per browser and per device.
 
 ---
 
 ## 🔌 API reference
 
-The following table reflects the route definitions present in the current source inspected for this README.
-
-| Method | Endpoint | Purpose |
+| Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/` | Serves `chat.html` |
-| `GET` | `/chat` | Serves `chat.html` |
-| `GET` | `/hello/{name}` | Returns a hello message |
-| `GET` | `/square/{number}` | Returns the square of an integer |
-| `POST` | `/user` | Accepts a name and age, then returns a greeting and age |
-| `GET` | `/search?name=...&age=...` | Returns a greeting and age |
-| `GET` | `/external-user/{user_id}` | Retrieves selected fields for an external user |
-| `GET` | `/llm-test?question=...` | Tests single-category Gemini intent classification |
-| `GET` | `/route?question=...` | Tests keyword-based tool routing |
-| `GET` | `/ask?question=...` | Runs the main agent flow |
-| `GET` | `/weather` | Runs the separate weather endpoint |
+| `GET` | `/` and `/chat` | Serves the chat UI |
+| `POST` | `/chat` | Main agent endpoint |
+| `GET` | `/ask?question=...` | Single-question endpoint (kept for older links) |
+| `GET` | `/health` | Health check, returns `{"status": "ok"}` |
+| `GET` | `/docs` | Interactive Swagger documentation |
 
-### Example requests
+### `POST /chat`
 
-**Chat / ASK endpoint**
-
-```text
-GET /ask?question=20%20times%205
-```
-
-**Square**
-
-```text
-GET /square/5
-```
-
-Example response:
+Request:
 
 ```json
 {
-  "number": 5,
-  "square": 25
+  "messages": [
+    { "role": "user", "content": "What is 12 times (3+4)?" }
+  ],
+  "memory": { "name": "Mayank" }
 }
 ```
 
-**Create/process user input**
-
-```http
-POST /user
-Content-Type: application/json
-```
+Response:
 
 ```json
 {
-  "name": "Mayank",
-  "age": 21
+  "reply": "12 times (3 + 4) is 84.",
+  "memory_updates": {},
+  "provider": "gemini"
 }
 ```
 
-The age above is an example value only.
-
-### Interactive API documentation
-
-FastAPI automatically provides interactive documentation at:
-
-```text
-/docs
-```
-
-For a local run, open `http://127.0.0.1:8000/docs`. For the deployed service, open the live API documentation link at the top of this README.
+Limits: up to 40 messages per request, 4,000 characters per message, 30 memory entries. The last message must come from the user. Exceeding the rate limit returns `429`; all providers failing returns `503`.
 
 ---
 
 ## 🚀 Run locally
 
-### 1. Clone the repository
+**1. Clone and enter the project**
 
 ```bash
 git clone https://github.com/mayankk-28/agentic-ai-learning.git
 cd agentic-ai-learning
 ```
 
-### 2. Create and activate a virtual environment
+**2. Create and activate a virtual environment**
 
-```bash
-python3 -m venv venv
-source venv/bin/activate
+Windows (PowerShell):
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 ```
 
-If creating the virtual environment fails on Ubuntu, install the system package that provides `venv`, then retry.
-
-### 3. Install dependencies
+macOS / Linux:
 
 ```bash
-pip install fastapi uvicorn python-dotenv requests openai
+python3 -m venv .venv
+source .venv/bin/activate
 ```
 
-### 4. Configure `.env`
+**3. Install dependencies**
 
-Create a `.env` file in the project root:
+```bash
+python -m pip install -r requirements.txt
+```
+
+**4. Create a `.env` file** in the project root (see the next section for the values).
+
+**5. Start the server**
+
+```bash
+python -m uvicorn main:app --reload
+```
+
+Open `http://127.0.0.1:8000`. After changing `.env`, stop the server (`Ctrl+C`) and start it again, because environment variables are read only at startup.
+
+---
+
+## 🔐 Environment variables
+
+Create a `.env` file (never commit it):
 
 ```env
-GEMINI_API_KEY=your_gemini_api_key
-APP_NAME=Agentic AI
-ENVIRONMENT=development
+GEMINI_API_KEY=your_gemini_key
+GEMINI_MODEL=gemini-3.1-flash-lite
+
+GROQ_API_KEY=your_groq_key
+GROQ_MODEL=openai/gpt-oss-120b
 ```
 
-Replace the API key placeholder with your own key. Do not commit the real key.
-
-### 5. Start the server
-
-```bash
-uvicorn main:app --reload
-```
-
-Then open:
-
-- Chat: `http://127.0.0.1:8000/`
-- Alternate chat path: `http://127.0.0.1:8000/chat`
-- API docs: `http://127.0.0.1:8000/docs`
-
----
-
-## 🔐 Environment variables and secrets
-
-The code reads these environment variables:
-
-| Variable | Purpose | Required? |
+| Variable | Purpose | Required |
 |---|---|---|
-| `GEMINI_API_KEY` | Authenticates the Gemini client | Required for Gemini-backed functionality |
-| `APP_NAME` | Application name printed at startup | Optional; defaults to `Agentic AI` |
-| `ENVIRONMENT` | Environment label printed at startup | Optional; defaults to `development` |
-| `MY_SECRET_KEY` | Read by the current source | Its use is not established by the inspected code sections |
+| `GEMINI_API_KEY` | Key for the primary model (free from Google AI Studio) | Recommended |
+| `GEMINI_MODEL` | Gemini model name | Optional (has a default) |
+| `GROQ_API_KEY` | Key for the fallback model (free from the Groq console) | Recommended |
+| `GROQ_MODEL` | Groq model name | Optional (has a default) |
 
-Keep `.env`, API credentials, virtual environments, Python cache files, and local runtime memory out of Git. The repository's `.gitignore` is intended to exclude sensitive and local-only files.
-
----
-
-## ⚠️ Error handling and current limitations
-
-The project is an educational prototype. Important limitations visible in the current implementation include:
-
-- Keyword routing may miss differently phrased requests.
-- The local calculator supports a limited set of patterns; complex or ambiguous expressions may be misinterpreted.
-- Gemini may return malformed JSON, time out, or become unavailable. Fallback routing handles some, but not all, failure cases.
-- The weather tool uses fixed coordinates instead of selecting a location from the user's question.
-- The user tool currently fetches a fixed external user ID.
-- The backend JSON memory is a shared local file, not a per-user database.
-- The browser history is stored locally in each browser and is separate from backend memory.
-- The app uses GET for `/ask`, so questions are placed in the URL. A POST endpoint would be more suitable for longer or sensitive prompts.
-- External services can be unavailable or change their response behavior.
-- The project does not currently provide production-grade authentication, authorization, or multi-user data isolation.
-
-Use only non-sensitive sample prompts and data when testing the public demo.
+At least one key is required. With both, you get automatic fallback. Free-tier model names change over time, so if a model returns `404` or `429`, list the models available to your key and update `GEMINI_MODEL`.
 
 ---
 
-## 📚 Learning outcomes
+## ☁️ Deploy on Render
 
-This project has provided hands-on practice with:
-
-- Python functions and control flow
-- FastAPI routes and request handling
-- Pydantic data validation
-- REST APIs and HTTP requests
-- Environment variables and API-key management
-- Gemini integration through an OpenAI-compatible client
-- LLM intent detection
-- Rule-based routing and fallback logic
-- Calculator planning and sequential operation execution
-- JSON-backed persistence
-- Browser `fetch()`, DOM updates, and `localStorage`
-- Error handling and debugging
-- Git, GitHub, and deployment workflows
+1. Push the repository to GitHub.
+2. In Render, create a **Web Service** from the repository.
+3. Build command: `pip install -r requirements.txt`
+4. Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+5. Add the four environment variables above in the **Environment** tab.
+6. Deploy. Later pushes to the main branch redeploy automatically.
 
 ---
 
-## 🛣️ Future improvements
+## ⚠️ Limitations
 
-Potential next steps include:
+- **Free-tier constraints.** Model quotas and availability depend on the providers' free plans.
+- **Cold starts.** Render's free service sleeps when idle, so the first request after a pause is slow.
+- **No live internet access.** The assistant cannot browse the web, so it says so when asked about very recent events.
+- **Memory is per browser.** It is not shared across devices.
+- **Plain-text replies.** Markdown and code blocks are not rendered yet.
+- **Rate limiter is in-memory.** It resets on restart and is suited to a single free instance.
+- **No authentication.** The public demo is open, protected only by the per-IP limit.
 
-- Stronger parsing and validation of calculator plans
-- More reliable tool selection and multi-tool planning
-- User-selected locations for weather requests
-- Configurable user IDs for external user lookups
-- Per-user memory stored in a database
-- Better tests for tool routing and calculation edge cases
-- A POST-based chat endpoint for longer prompts
-- More consistent API timeouts and error responses
-- Authentication and access control
-- Clearer separation of frontend, tools, and orchestration modules
-- Automated deployment checks and improved observability
+---
+
+## 🛣️ Roadmap
+
+- [ ] Streaming responses (token-by-token output)
+- [ ] Markdown and code-block rendering in the chat UI
+- [ ] Web search tool for current information
+- [ ] Persistent per-user memory in a free database
+- [ ] Automated tests with a mocked LLM
+- [ ] Authentication and per-user quotas
+
+---
+
+## 📚 What I learned
+
+- How an LLM **tool-calling loop** really works: the model requests a tool, the server runs it and returns the result, and the loop repeats until a final answer
+- Designing safe tools (an AST-based calculator instead of `eval`)
+- Making free-tier LLM APIs dependable with **fallbacks, timeouts and per-request provider consistency**
+- Building a **stateless backend** and keeping state in the client
+- Input validation and rate limiting with FastAPI and Pydantic
+- Debugging real API failures: `404` for retired models, `429` quota limits, `503` overload and timeouts
+- Deploying and configuring a service on Render
 
 ---
 
 ## 👨‍💻 About
 
-I'm **Mayank Chouhan**, a B.Tech CSE student interested in Artificial Intelligence, Python, backend development, FastAPI, Agentic AI, and automation.
+I'm **Mayank Chouhan**, a B.Tech Computer Science Engineering student building toward a career as an AI engineer. I learn by building, testing and debugging real applications, and ASK is where I explore how AI agents work from the inside.
 
-ASK is part of my hands-on learning journey: understanding AI agents by building, testing, debugging, and improving a working application.
+- GitHub: [mayankk-28](https://github.com/mayankk-28)
+- LinkedIn: [Mayank Chouhan](https://www.linkedin.com/in/mayank-chouhan-2b318b365)
 
 ---
 
-**ASK — Ask something. Let the agent figure out the tool. 🤖**
+**ASK — Ask anything. The agent decides when it needs a tool. 🤖**
